@@ -1,0 +1,73 @@
+#ein zwei polizei krei dier grenadier
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import torch
+from fractal_mamba import FractalMambaNet, SelectiveSSM, FractalMambaBlock
+
+
+def test_selective_ssm_shapes():
+    ssm = SelectiveSSM(d_model=32, d_state=8)
+    x = torch.randn(2, 17, 32)
+    y, h = ssm(x)
+    assert y.shape == (2, 17, 32)
+    assert h.shape == (2, 32, 8)
+
+
+def test_fractal_block_odd_length_and_recursion():
+    block = FractalMambaBlock(d_model=16, d_state=8, coarsen_factor=2, max_levels=3)
+    x = torch.randn(2, 13, 16)  # deliberately not a power of 2
+    y, scales = block(x, collect_scales=True)
+    assert y.shape == x.shape
+    assert len(scales) >= 2  # recursed at least one level
+
+
+def test_fractal_block_no_recursion_short_seq():
+    block = FractalMambaBlock(d_model=8, d_state=4, coarsen_factor=2, max_levels=4)
+    x = torch.randn(1, 3, 8)  # too short to recurse (< 2*factor)
+    y, scales = block(x, collect_scales=True)
+    assert y.shape == x.shape
+    assert len(scales) == 1
+
+
+def test_model_forward_and_backward():
+    torch.manual_seed(0)
+    model = FractalMambaNet(vocab_size=50, d_model=24, d_state=8, n_blocks=2, max_levels=3)
+    tokens = torch.randint(0, 50, (3, 21))
+    targets = torch.randint(0, 50, (3, 21))
+
+    logits, aux = model(tokens, collect_scales=True)
+    assert logits.shape == (3, 21, 50)
+    assert "scale_invariant_loss" in aux
+
+    task_loss = torch.nn.functional.cross_entropy(logits.reshape(-1, 50), targets.reshape(-1))
+    loss = task_loss + 0.05 * aux["scale_invariant_loss"]
+    loss.backward()
+
+    # Every parameter that participates should have received a gradient.
+    n_none = 0
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            n_none += 1
+    assert n_none == 0, f"{n_none} parameters got no gradient"
+
+
+def test_share_weights_false_variant():
+    model = FractalMambaNet(
+        vocab_size=20, d_model=16, d_state=4, n_blocks=1, max_levels=2, share_weights=False
+    )
+    tokens = torch.randint(0, 20, (2, 9))
+    logits, aux = model(tokens)
+    assert logits.shape == (2, 9, 20)
+    loss = aux["scale_invariant_loss"]
+    loss.backward()
+
+
+if __name__ == "__main__":
+    test_selective_ssm_shapes()
+    test_fractal_block_odd_length_and_recursion()
+    test_fractal_block_no_recursion_short_seq()
+    test_model_forward_and_backward()
+    test_share_weights_false_variant()
+    print("All tests passed, now go play minecraft and terraria")
+#signed ez kid aka you get the drill
