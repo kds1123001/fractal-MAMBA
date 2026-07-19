@@ -1,0 +1,63 @@
+#im tired grandpa 
+#WELL THATS TOO DAYUMN BAD KEEP DIGGIN 
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+from .block import FractalMambaBlock
+from .losses import ScaleInvariantLoss
+
+
+class FractalMambaNet(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 128,
+        d_state: int = 16,
+        n_blocks: int = 4,
+        coarsen_factor: int = 2,
+        max_levels: int = 4,
+        share_weights: bool = True,
+        target_spectral_alpha: float = 1.0,
+    ):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, d_model)
+        self.blocks = nn.ModuleList(
+            [
+                FractalMambaBlock(
+                    d_model=d_model,
+                    d_state=d_state,
+                    coarsen_factor=coarsen_factor,
+                    max_levels=max_levels,
+                    share_weights=share_weights,
+                )
+                for _ in range(n_blocks)
+            ]
+        )
+        self.head = nn.Linear(d_model, vocab_size)
+        self.si_loss = ScaleInvariantLoss(target_alpha=target_spectral_alpha)
+
+    def forward(self, tokens: torch.Tensor, collect_scales: bool = True):
+       
+        x = self.embed(tokens)
+        all_scales = []
+        for block in self.blocks:
+            x, scales = block(x, level=0, collect_scales=collect_scales)
+            if collect_scales:
+                all_scales.append((block, scales, x))
+        logits = self.head(x)
+
+        if not collect_scales:
+            return logits, None
+
+        total = x.new_zeros(())
+        components = {"rg_fixed_point": x.new_zeros(()), "power_law_spectrum": x.new_zeros(())}
+        for block, scales, block_out in all_scales:
+            loss_i, comp_i = self.si_loss(scales, block.coarsen, block_out)
+            total = total + loss_i
+            for k in components:
+                components[k] = components[k] + comp_i[k]
+        n = max(len(all_scales), 1)
+        aux = {"scale_invariant_loss": total / n, "components": {k: v / n for k, v in components.items()}}
+        return logits, aux
