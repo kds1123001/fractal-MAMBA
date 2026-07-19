@@ -1,0 +1,62 @@
+#u bald vegeta
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class SelectiveSSM(nn.Module):
+   
+
+    def __init__(self, d_model: int, d_state: int = 16, dt_rank: int | None = None):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.dt_rank = dt_rank or max(1, d_model // 16)
+
+       
+        self.x_proj = nn.Linear(d_model, self.dt_rank + 2 * d_state, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, d_model, bias=True)
+
+       
+        A_init = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(d_model, 1)
+        self.A_log = nn.Parameter(torch.log(A_init)) 
+        self.D = nn.Parameter(torch.ones(d_model))  #
+
+       
+        dt_min, dt_max = 1e-3, 1e-1
+        dt = torch.exp(
+            torch.rand(d_model) * (torch.log(torch.tensor(dt_max)) - torch.log(torch.tensor(dt_min)))
+            + torch.log(torch.tensor(dt_min))
+        )
+        inv_softplus = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_softplus)
+
+    def forward(self, x: torch.Tensor, state: torch.Tensor | None = None):
+        
+        B, L, D = x.shape
+        N = self.d_state
+ 
+        dt_low, Bc, Cc = torch.split(x_dbl, [self.dt_rank, N, N], dim=-1)
+        dt = F.softplus(self.dt_proj(dt_low))  
+
+        A = -torch.exp(self.A_log) 
+
+       
+        A_bar = torch.exp(dt.unsqueeze(-1) * A)
+        B_bar = dt.unsqueeze(-1) * Bc.unsqueeze(2)  
+
+        if state is None:
+            h = x.new_zeros(B, D, N)
+        else:
+            h = state
+
+        ys = []
+        for t in range(L):
+            h = A_bar[:, t] * h + B_bar[:, t] * x[:, t].unsqueeze(-1)  
+            y_t = torch.einsum("bdn,bn->bd", h, Cc[:, t])
+            ys.append(y_t)
+        y = torch.stack(ys, dim=1) + self.D * x  
+        return y, h
