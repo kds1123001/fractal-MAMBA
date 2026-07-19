@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .ssm import SelectiveSSM
+
+
+class CoarseGrain(nn.Module):
+   
+
+    def __init__(self, d_model: int, factor: int = 2):
+        super().__init__()
+        self.factor = factor
+        self.merge = nn.Sequential(
+            nn.Linear(d_model * factor, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        
+        B, L, D = x.shape
+        f = self.factor
+        pad = (-L) % f
+        if pad:
+            x = F.pad(x, (0, 0, 0, pad)) 
+        Lp = x.shape[1]
+        groups = x.view(B, Lp // f, f * D)
+        return self.merge(groups)
+
+
+class FractalMambaBlock(nn.Module):
+    
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        coarsen_factor: int = 2,
+        max_levels: int = 4,
+        share_weights: bool = True,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.coarsen_factor = coarsen_factor
+        self.max_levels = max_levels
+        self.share_weights = share_weights
+
+        self.ssm = SelectiveSSM(d_model, d_state=d_state)
+        self.coarsen = CoarseGrain(d_model, factor=coarsen_factor)
+        self.norm = nn.LayerNorm(d_model)
+
+        if not share_weights:
+            self.ssm_levels = nn.ModuleList(
+                [SelectiveSSM(d_model, d_state=d_state) for _ in range(max_levels)]
+            )
+            self.coarsen_levels = nn.ModuleList(
+                [CoarseGrain(d_model, factor=coarsen_factor) for _ in range(max_levels)]
+            )
+
+       
+        self.log_lambda = nn.Parameter(torch.zeros(max_levels))
+
+    def _ssm_at(self, level: int) -> SelectiveSSM:
+        return self.ssm if self.share_weights else self.ssm_levels[level]
+
+    def _coarsen_at(self, level: int) -> CoarseGrain:
+        return self.coarsen if self.share_weights else self.coarsen_levels[level]
+
+    def forward(self, x: torch.Tensor, level: int = 0, collect_scales: bool = False):
+       
+        B, L, D = x.shape
+        ssm = self._ssm_at(level)
+        fine_out, _ = ssm(x) 
+        scales = [] if not collect_scales else [(level, fine_out, x)]
+
+        can_recurse = level + 1 < self.max_levels and L >= 2 * self.coarsen_factor
+        if can_recurse:
+            coarsen = self._coarsen_at(level)
+            x_coarse = coarsen(x)  
+            coarse_out, deeper_scales = self.forward(
+                x_coarse, level=level + 1, collect_scales=collect_scales
+            )
+            if collect_scales:
+                scales.extend(deeper_scales)
+
+            #
+            up = F.interpolate(
+                coarse_out.transpose(1, 2), size=L, mode="linear", align_corners=False
+            ).transpose(1, 2)
+
+            gain = torch.exp(self.log_lambda[level])  
+            y = self.norm(fine_out + gain * up)
+        else:
+            y = self.norm(fine_out)
+
+        return y, scales
