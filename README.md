@@ -1,101 +1,84 @@
-# Fractal Mamba: Neural Renormalization-Group Flows for State-Space Models
+# fractal-mamba
 
-A PyTorch implementation of `FractalMambaBlock` — a selective state-space
-(Mamba-style) block that is applied **recursively across a hierarchy of
-coarse-grained sequence resolutions**, with an explicit auxiliary loss
-that pushes the model toward a **fixed point of a renormalization group
-(RG) transformation**, and a spectral regularizer that encourages
-scale-free (power-law) internal representations.
+A PyTorch experiment with a Mamba-style selective state-space block. The block runs on the full sequence, then on a shortened version of it, then on an even shorter one, and so on. The same weights are used at every level. Two extra loss terms are meant to make the model behave consistently across those levels.
 
-## Why RG flow?
+This is a research toy. I have not shown that it beats a normal flat model.
 
-In statistical/quantum field theory, an RG transformation `R` coarse-grains
-microscopic degrees of freedom (e.g. block-spins on a lattice) and produces
-a *renormalized* theory with rescaled coupling constants. A theory is
-**scale-invariant** at a fixed point if applying the physics and then
-coarse-graining gives the same result as coarse-graining and then applying
-the physics: `R[F(x)] = F(R[x])`.
+## The idea
 
-Standard deep sequence models (flat Transformer/Mamba stacks) have no
-notion of scale at all — every layer sees the sequence at the same
-resolution. This repo instead treats **sequence-length coarse-graining as
-a literal RG step**, shares the SSM's parameters across scales (so the
-"physics" has the same functional form at every resolution, exactly as
-in a scale-invariant field theory), and lets a single learned per-level
-gain (the RG eigenvalue `lambda^level`) decide whether the coarse
-("infrared") mode is *relevant* (`lambda > 1`, amplified with depth) or
-*irrelevant* (`lambda < 1`, suppressed with depth).
+The idea comes from physics. In the renormalization group (RG), you coarse-grain a system, for example by merging neighboring spins on a lattice, and then look at how the description changes. Models that behave the same way at every scale are called scale-invariant.
 
-| RG concept | Code |
-|---|---|
+I borrowed that picture for sequences. Coarse-graining a sequence means pooling it down to fewer positions. Here is how the pieces map to code:
+
+| Physics idea | In this repo |
+| --- | --- |
 | Microscopic degrees of freedom | tokens at the finest resolution |
-| Block-spin coarse-graining `R` | `CoarseGrain` (learned local pooling) |
-| Renormalized Hamiltonian `H' = R[H]` | the same `SelectiveSSM` weights re-applied to the coarse sequence |
-| Flow of coupling constants | `FractalMambaBlock.log_lambda` (per-level gain) |
-| Relevant / irrelevant operators | sign & magnitude of the learned gain |
-| Fixed point of the RG map | `RGFixedPointLoss` (commutation penalty) |
-| Scale-free / critical spectrum | `PowerLawSpectrumLoss` (power ~ k^-alpha) |
+| Coarse-graining step | `CoarseGrain`, a learned local pooling |
+| Same "physics" at every scale | the same `SelectiveSSM` weights, reused on each coarser sequence |
+| Couplings changing with scale | `FractalMambaBlock.log_lambda`, one learned gain per level |
+| Fixed point of the RG map | `RGFixedPointLoss` |
+| Scale-free spectrum | `PowerLawSpectrumLoss`, which pushes power toward k^-alpha |
 
-## Repo layout
+The fixed-point loss checks a commutation condition: coarse-graining and then processing should give about the same result as processing and then coarse-graining, or `R[F(x)] = F(R[x])`. That is a consistency loss inspired by RG. It does not prove the model is at an RG fixed point.
+
+## What is in the repo
 
 ```
 fractal_mamba/
-  ssm.py      # SelectiveSSM: pure-PyTorch selective scan (Mamba-lite)
-  block.py    # CoarseGrain + FractalMambaBlock (the recursive RG block)
-  losses.py   # RGFixedPointLoss, PowerLawSpectrumLoss, ScaleInvariantLoss
-  model.py    # FractalMambaNet: embedding + stacked blocks + head
-examples/
-  train_demo.py   # synthetic long-range "selective copy" recall task
+  __init__.py
+  ssm.py      SelectiveSSM, a pure PyTorch selective scan
+  block.py    CoarseGrain and FractalMambaBlock
+  losses.py   RGFixedPointLoss, PowerLawSpectrumLoss, ScaleInvariantLoss
+  model.py    FractalMambaNet: embedding, stacked blocks, output head
 tests/
-  test_shapes.py  # shape/gradient sanity checks (all currently passing)
+  test_shapes.py
 ```
 
-## Quickstart
+## Usage
 
-```bash
+```
 pip install torch
-python tests/test_shapes.py        # sanity checks
-python examples/train_demo.py      # toy training FUNNNNNN
+python tests/test_shapes.py
 ```
 
 ```python
+import torch.nn.functional as F
 from fractal_mamba import FractalMambaNet
 
 model = FractalMambaNet(vocab_size=50257, d_model=256, d_state=16, n_blocks=6)
 logits, aux = model(tokens)  # tokens: (B, L) long tensor
 
-task_loss = cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
+task_loss = F.cross_entropy(logits.view(-1, 50257), targets.view(-1))
 loss = task_loss + 0.05 * aux["scale_invariant_loss"]
 loss.backward()
 ```
 
-`aux["components"]` exposes the unweighted `rg_fixed_point` and
-`power_law_spectrum` sub-losses separately for logging/ablation.
+The 0.05 is just the weight in this example. `aux["components"]` gives the two sub-losses, `rg_fixed_point` and `power_law_spectrum`, separately and unweighted, so you can log them or turn one off.
 
-## Honesty about scope
+## What is not shown
 
-This is a **research scaffold**, not a paper's worth of validated
-results:
+- **No results.** I have not compared this against a flat Mamba or a Transformer. A fair test would use matched parameter counts, several random seeds, and a task like Long Range Arena or a real text corpus. It would also include a third model: the same recursive model with the auxiliary loss weight set to 0. That separates the effect of the hierarchy from the effect of the loss.
+- **The fixed-point loss going down proves little.** I'm minimizing it, so it should go down. A consistency loss like this can also be satisfied by collapsing the representations toward a constant. This repo doesn't check for that. Logging the feature variance or effective rank next to the loss would show it.
+- **The scan is slow.** `ssm.py` uses a plain Python loop over the sequence, which is easy to read and check but slow on long sequences. It is not the fused CUDA kernel from the official `mamba-ssm` package. A parallel scan is the main thing to add before using this on long inputs.
+- **The "RG eigenvalue" is one learned number per level.** Real RG flows have a whole spectrum of eigenvalues. Treat this as a simple stand-in.
+- **The tests are shape and gradient checks.** They check that the code runs and gradients flow. They don't check that the model works well.
+- **"Fractal" just means shared weights across scales.** I haven't shown self-similar behavior beyond that.
 
-- The selective-scan in `ssm.py` is a plain sequential `for`-loop for
-  clarity/auditability, not the fused parallel-scan CUDA kernel from the
-  official `mamba-ssm` — expect it to be slow on long sequences (O(L)
-  Python-level steps). Swapping in a parallel associative scan is the
-  main thing needed before scaling this up.
-- `examples/train_demo.py` is a smoke test showing the whole pipeline
-  trains without shape/gradient errors and that the RG fixed-point loss
-  measurably decreases (i.e. the coarse-graining is learning toward
-  self-consistency) — it is **not** a benchmark result, and 300 steps on
-  a tiny model is nowhere near enough to claim the fractal hierarchy
-  outperforms a flat baseline. A real ablation (fractal vs. flat Mamba,
-  matched parameter count, on e.g. Long Range Arena or a real LM corpus)
-  is the natural next step before writing this up.
-- The "RG eigenvalue" `lambda` is a single learned scalar per level, a
-  deliberately simple stand-in for the much richer operator-scaling
-  structure of real RG flows (which has a whole spectrum of eigenvalues
-  per coupling). Treat it as a suggestive inductive bias, not a
-  first-principles derivation.
+## Why the name
 
-## credits
-MEEE I MADE IT YIPEEEE
-           #NO FLUFFIN LLM WAS USED OKAINA#
+I got the idea from a short video I can't find anymore: a stock photo of a mamba in a suit and tie, with a Jujutsu Kaisen-style narrator explaining "fractal mamba." The snake and the architecture share a name, and I couldn't leave it alone. If you know where that video is, please open an issue.
+
+## References
+
+- Albert Gu and Tri Dao, "Mamba: Linear-Time Sequence Modeling with Selective State Spaces" (2023).
+- Zihang Dai, Guokun Lai, Yiming Yang, and Quoc Le, "Funnel-Transformer" (2020), which also shortens sequences with pooling.
+- Pankaj Mehta and David Schwab, "An exact mapping between the Variational Renormalization Group and Deep Learning" (2014).
+
+## Credits
+
+Made by kds1123001.
+gng✈️📗🍏🥬🔵🟩🌳💙💦💦🏡🏡
+
+## License
+
+MIT. See `LICENSE`.
